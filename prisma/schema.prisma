@@ -1,0 +1,465 @@
+// TruBlue Job Estimator — data model
+// SQLite has no native enums in Prisma, so enum-like fields are Strings.
+// Allowed values are documented inline and enforced in application code (src/lib/engine/types.ts).
+// JSON payloads are stored as String and parsed in application code.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Users & settings
+// ---------------------------------------------------------------------------
+
+model User {
+  id        String   @id @default(cuid())
+  name      String
+  email     String?  @unique
+  role      String   @default("OWNER") // OWNER | ESTIMATOR | TECHNICIAN
+  createdAt DateTime @default(now())
+}
+
+/// Singleton row (id = "default"). One per franchise territory in future multi-tenant setups.
+model BusinessSettings {
+  id                   String   @id @default("default")
+  companyName          String   @default("TruBlue Home Service Ally")
+  companyPhone         String   @default("")
+  companyEmail         String   @default("")
+  companyAddress       String   @default("")
+  state                String   @default("")
+  territoryZips        String   @default("") // comma-separated
+  licensesHeld         String   @default("[]") // JSON string[]
+  approvedSubs         String   @default("[]") // JSON {trade,name,phone}[]
+
+  // Margin targets (decimals, e.g. 0.45 = 45%) — gross margin on risk-adjusted direct cost
+  minMarginPct         Float    @default(0.35)
+  targetMarginPct      Float    @default(0.50)
+  premiumMarginPct     Float    @default(0.58)
+  minNetMarginPct      Float    @default(0.05) // floor after overhead + contingency
+
+  materialMarkupPct    Float    @default(0.30)
+  subMarkupPct         Float    @default(0.20)
+
+  contingencyLowPct    Float    @default(0.05)
+  contingencyMediumPct Float    @default(0.10)
+  contingencyHighPct   Float    @default(0.20)
+
+  minServiceCharge     Float    @default(195)
+  minBillableHours     Float    @default(2)
+  tripCharge           Float    @default(0)
+  diagnosticFee        Float    @default(95)
+
+  mileageRate          Float    @default(0.70)
+  defaultRoundTripMiles Float   @default(20)
+  defaultTravelHours   Float    @default(0.75) // per visit, round trip, per crew member
+  defaultProcurementHours Float @default(0.5)
+
+  overheadItems        String   @default("[]") // JSON {name, monthly}[]
+  overheadMethod       String   @default("PER_TECH_HOUR") // PER_TECH_HOUR | PCT_REVENUE | PER_JOB | HYBRID
+  billableTechHoursPerMonth Float @default(320)
+  jobsPerMonth         Float    @default(40)
+  expectedMonthlyRevenue Float  @default(45000)
+  hybridPerJobShare    Float    @default(0.3)
+
+  standardWorkdayHours Float    @default(8)
+  halfDayHours         Float    @default(4)
+  halfDayPrice         Float    @default(495)
+  fullDayHours         Float    @default(8)
+  fullDayPrice         Float    @default(895)
+
+  taxRatePct           Float    @default(0)
+  taxMaterialsOnly     Boolean  @default(true)
+  priceRounding        Float    @default(5)
+
+  paymentTerms         String   @default("50% deposit to schedule for jobs over $1,000; balance due on completion. Jobs under $1,000 are due on completion.")
+  warrantyText         String   @default("[Warranty placeholder — insert your franchise workmanship warranty terms here.]")
+  estimateValidDays    Int      @default(30)
+
+  recurringAssumptions String   @default("{}") // JSON — Phase 2 Home Ally plan defaults
+
+  updatedAt            DateTime @updatedAt
+}
+
+model LaborProfile {
+  id              String  @id @default(cuid())
+  role            String  @unique // LEAD | TECH | HELPER
+  name            String
+  hourlyWage      Float
+  payrollTaxPct   Float   // employer FICA/FUTA/SUTA as decimal
+  workersCompPct  Float
+  benefitsPerHour Float
+  otherBurdenPct  Float
+  billingRate     Float   // customer-facing rate — NOT the cost
+  active          Boolean @default(true)
+  sortOrder       Int     @default(0)
+}
+
+model Employee {
+  id             String  @id @default(cuid())
+  name           String
+  laborProfileId String
+  active         Boolean @default(true)
+}
+
+// ---------------------------------------------------------------------------
+// Service catalog & knowledge base
+// ---------------------------------------------------------------------------
+
+model ServiceLine {
+  id          String        @id // ON_DEMAND | SENIOR | RECURRING
+  name        String
+  description String
+  enabled     Boolean       @default(true)
+  categories  JobCategory[]
+}
+
+model JobCategory {
+  id            String        @id
+  name          String
+  serviceLineId String
+  serviceLine   ServiceLine   @relation(fields: [serviceLineId], references: [id])
+  templates     JobTemplate[]
+}
+
+model JobTemplate {
+  id                 String   @id @default(cuid())
+  key                String   @unique
+  name               String
+  categoryId         String
+  category           JobCategory @relation(fields: [categoryId], references: [id])
+  description        String   @default("")
+  unit               String   // e.g. "each", "board", "sq ft", "linear ft"
+  lowHoursPerUnit    Float
+  typicalHoursPerUnit Float
+  highHoursPerUnit   Float
+  setupHours         Float    @default(0.25)
+  cleanupHours       Float    @default(0.25)
+  crew               String   @default("[\"LEAD\"]") // JSON Role[]
+  skillLevel         String   @default("SKILLED") // BASIC | SKILLED | ADVANCED
+  tradeFlags         String   @default("[]") // JSON: ELECTRICAL | PLUMBING | HVAC | STRUCTURAL | PERMIT | MAJOR_REMODEL
+  keywords           String   @default("[]") // JSON string[] used by the rule-based matcher
+  complications      String   @default("[]") // JSON string[]
+  riskKeys           String   @default("[]") // JSON RiskKey[]
+  materials          String   @default("[]") // JSON {materialKey, qtyPerUnit, perJob?}[]
+  otherCosts         String   @default("[]") // JSON {type, description}[]
+  questions          String   @default("[]") // JSON string[] follow-up questions
+  // Provenance — seed values are assumptions until replaced by franchise history.
+  source             String   @default("SEED_ASSUMPTION") // SEED_ASSUMPTION | OWNER_EDITED | HISTORY_APPROVED
+  needsValidation    Boolean  @default(true)
+  validationNote     String   @default("Initial assumption — validate with actual TruBlue job history.")
+  updatedAt          DateTime @updatedAt
+}
+
+model Material {
+  id          String          @id @default(cuid())
+  key         String          @unique
+  name        String
+  unit        String
+  category    String          @default("General")
+  wastePct    Float           @default(0)
+  prices      MaterialPrice[]
+}
+
+/// Every price carries a source + date. Future integrations (Home Depot, Lowe's, suppliers,
+/// receipts, history) simply add MaterialPrice rows with a different `source`.
+model MaterialPrice {
+  id         String   @id @default(cuid())
+  materialId String
+  material   Material @relation(fields: [materialId], references: [id], onDelete: Cascade)
+  unitCost   Float
+  source     String   // MANUAL | DEMO_PRICE_BOOK | RECEIPT | HOME_DEPOT | LOWES | LOCAL_SUPPLIER | HISTORICAL
+  sourceNote String   @default("")
+  zip        String?
+  asOf       DateTime
+  createdAt  DateTime @default(now())
+
+  @@index([materialId, asOf])
+}
+
+model Subcontractor {
+  id              String  @id @default(cuid())
+  name            String
+  trade           String
+  phone           String  @default("")
+  licenseNumber   String  @default("")
+  approved        Boolean @default(true)
+}
+
+model RiskFactor {
+  key         String @id
+  label       String
+  weight      Int
+  explanation String
+}
+
+// ---------------------------------------------------------------------------
+// Customers & properties
+// ---------------------------------------------------------------------------
+
+model Customer {
+  id           String     @id @default(cuid())
+  name         String
+  email        String     @default("")
+  phone        String     @default("")
+  customerType String     @default("HOMEOWNER") // HOMEOWNER | SENIOR | CAREGIVER | REALTOR | PROPERTY_MANAGER | COMMERCIAL | HOME_ALLY
+  existing     Boolean    @default(false)
+  isDemo       Boolean    @default(false)
+  createdAt    DateTime   @default(now())
+  properties   Property[]
+  estimates    Estimate[]
+}
+
+model Property {
+  id           String     @id @default(cuid())
+  customerId   String
+  customer     Customer   @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  address      String
+  zip          String
+  propertyType String     @default("SINGLE_FAMILY") // SINGLE_FAMILY | CONDO | TOWNHOUSE | APARTMENT | COMMERCIAL | OTHER
+  ageBand      String     @default("UNKNOWN") // LT10 | 10_25 | 25_50 | 50_PLUS | UNKNOWN
+  occupied     Boolean    @default(true)
+  notes        String     @default("")
+  estimates    Estimate[]
+}
+
+// ---------------------------------------------------------------------------
+// Estimates (versioned)
+// ---------------------------------------------------------------------------
+
+model Estimate {
+  id               String            @id @default(cuid())
+  number           String            @unique
+  title            String
+  serviceLineId    String            @default("ON_DEMAND")
+  status           String            @default("DRAFT") // DRAFT | SENT | WON | LOST | COMPLETED
+  customerId       String
+  customer         Customer          @relation(fields: [customerId], references: [id])
+  propertyId       String
+  property         Property          @relation(fields: [propertyId], references: [id])
+  currentVersionId String?
+  isDemo           Boolean           @default(false)
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  versions         EstimateVersion[]
+  photos           Photo[]
+  completedJob     CompletedJob?
+  changeOrders     ChangeOrder[]
+  acceptance       EstimateAcceptance?
+  aiRuns           AiRun[]
+}
+
+/// Immutable snapshot. Editing an estimate creates a new version; earlier versions are preserved.
+model EstimateVersion {
+  id               String   @id @default(cuid())
+  estimateId       String
+  estimate         Estimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+  version          Int
+  inputJson        String   // EstimateInput — everything needed to recompute
+  resultJson       String   // EstimateResult — computed server-side by the deterministic engine
+  settingsJson     String   // settings + labor profiles snapshot used for the calculation
+  aiReasoningJson  String   @default("{}") // scope explanation, assumptions, review
+  selectedScenario String   // COMPETITIVE | RECOMMENDED | PREMIUM | CUSTOM | MINIMUM
+  quotedPrice      Float
+  priceOverridden  Boolean  @default(false)
+  note             String   @default("")
+  createdAt        DateTime @default(now())
+
+  tasks            EstimateTask[]
+  materials        EstimateMaterial[]
+  subcontractors   EstimateSubcontractor[]
+  otherCosts       OtherCost[]
+  riskFactors      EstimateRiskFactor[]
+  pricing          PricingRecommendation[]
+
+  @@unique([estimateId, version])
+}
+
+// Normalized copies of the version's line items for querying (comparables, analytics).
+model EstimateTask {
+  id            String          @id @default(cuid())
+  versionId     String
+  version       EstimateVersion @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  templateKey   String?
+  name          String
+  quantity      Float
+  unit          String
+  hoursPerUnit  Float
+  techHours     Float
+  crewHours     Float
+  crew          String // JSON Role[]
+  hoursSource   String
+}
+
+model EstimateMaterial {
+  id            String          @id @default(cuid())
+  versionId     String
+  version       EstimateVersion @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  materialKey   String?
+  name          String
+  quantity      Float
+  unit          String
+  unitCost      Float?
+  wastePct      Float
+  markupPct     Float
+  cost          Float
+  sellingPrice  Float
+  source        String
+  priceDate     String?
+}
+
+model EstimateSubcontractor {
+  id             String          @id @default(cuid())
+  versionId      String
+  version        EstimateVersion @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  trade          String
+  description    String
+  quotedCost     Float
+  markupPct      Float
+  customerPrice  Float
+  licenseRequired Boolean
+  quoteReceived  Boolean
+}
+
+model OtherCost {
+  id          String          @id @default(cuid())
+  versionId   String
+  version     EstimateVersion @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  type        String // EQUIPMENT | PERMIT | PARKING | TOLLS | DISPOSAL | DELIVERY | SPECIAL_ORDER | TRAVEL | OTHER
+  description String
+  amount      Float
+}
+
+model EstimateRiskFactor {
+  id        String          @id @default(cuid())
+  versionId String
+  version   EstimateVersion @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  key       String
+  note      String
+}
+
+model PricingRecommendation {
+  id          String          @id @default(cuid())
+  versionId   String
+  version     EstimateVersion @relation(fields: [versionId], references: [id], onDelete: Cascade)
+  scenario    String
+  price       Float
+  grossProfit Float
+  grossMarginPct Float
+  netProfit   Float
+}
+
+model Photo {
+  id          String    @id @default(cuid())
+  estimateId  String?
+  estimate    Estimate? @relation(fields: [estimateId], references: [id], onDelete: SetNull)
+  filename    String
+  mimeType    String
+  caption     String    @default("")
+  findingsJson String   @default("{}") // {observed[], inferred[], unknown[]}
+  createdAt   DateTime  @default(now())
+}
+
+/// Audit log of every AI interaction — the "record reasoning" requirement.
+model AiRun {
+  id          String    @id @default(cuid())
+  estimateId  String?
+  estimate    Estimate? @relation(fields: [estimateId], references: [id], onDelete: SetNull)
+  kind        String    // SCOPE | REVIEW
+  engine      String    // model id, or "rule-based"
+  inputJson   String
+  outputJson  String
+  notice      String    @default("")
+  createdAt   DateTime  @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// Execution & learning loop
+// ---------------------------------------------------------------------------
+
+model CompletedJob {
+  id                 String          @id @default(cuid())
+  estimateId         String          @unique
+  estimate           Estimate        @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+  versionId          String
+  completedAt        DateTime
+  actualMaterialCost Float
+  actualSubCost      Float
+  actualOtherCost    Float
+  finalRevenue       Float
+  changeOrderRevenue Float           @default(0)
+  varianceReason     String          @default("")
+  notes              String          @default("")
+  resultJson         String          // VarianceResult computed by the engine
+  createdAt          DateTime        @default(now())
+  labor              ActualLabor[]
+  materials          ActualMaterial[]
+}
+
+model ActualLabor {
+  id             String       @id @default(cuid())
+  completedJobId String
+  completedJob   CompletedJob @relation(fields: [completedJobId], references: [id], onDelete: Cascade)
+  role           String
+  hours          Float
+  employeeName   String       @default("")
+}
+
+model ActualMaterial {
+  id             String       @id @default(cuid())
+  completedJobId String
+  completedJob   CompletedJob @relation(fields: [completedJobId], references: [id], onDelete: Cascade)
+  name           String
+  cost           Float
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2 placeholders (tables exist; workflows not built in V1)
+// ---------------------------------------------------------------------------
+
+model ChangeOrder {
+  id            String   @id @default(cuid())
+  estimateId    String
+  estimate      Estimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+  description   String
+  additionalHours Float  @default(0)
+  additionalMaterials Float @default(0)
+  additionalCost Float   @default(0)
+  customerPrice Float    @default(0)
+  status        String   @default("PENDING") // PENDING | APPROVED | DECLINED
+  createdAt     DateTime @default(now())
+}
+
+model EstimateAcceptance {
+  id          String   @id @default(cuid())
+  estimateId  String   @unique
+  estimate    Estimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+  versionId   String
+  acceptedBy  String
+  acceptedAt  DateTime
+  signature   String   @default("")
+  acceptedOptions String @default("[]")
+}
+
+model RecurringPlan {
+  id             String   @id @default(cuid())
+  customerId     String
+  propertyId     String
+  name           String
+  visitsPerYear  Int
+  hoursPerVisit  Float
+  crewSize       Int      @default(1)
+  materialsPerVisit Float @default(0)
+  travelCostPerVisit Float @default(0)
+  adminHoursPerYear Float @default(0)
+  priorityAllowanceHours Float @default(0)
+  addOnDiscountPct Float  @default(0)
+  annualPrice    Float
+  status         String   @default("DRAFT")
+  isDemo         Boolean  @default(false)
+  createdAt      DateTime @default(now())
+}
